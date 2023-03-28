@@ -1,374 +1,365 @@
-#![cfg(not(target_arch = "wasm32"))]
+extern crate reqwest;
+
+#[macro_use]
 mod support;
-use futures_util::stream::StreamExt;
-use support::*;
 
-use reqwest::Client;
+use std::io::Read;
 
-#[tokio::test]
-async fn auto_headers() {
-    let server = server::http(move |req| async move {
-        assert_eq!(req.method(), "GET");
+#[test]
+fn test_response_text() {
+    let server = server! {
+        request: b"\
+            GET /text HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 5\r\n\
+            \r\n\
+            Hello\
+            "
+    };
 
-        assert_eq!(req.headers()["accept"], "*/*");
-        assert_eq!(req.headers().get("user-agent"), None);
-        if cfg!(feature = "gzip") {
-            assert!(req.headers()["accept-encoding"]
-                .to_str()
-                .unwrap()
-                .contains("gzip"));
-        }
-        if cfg!(feature = "brotli") {
-            assert!(req.headers()["accept-encoding"]
-                .to_str()
-                .unwrap()
-                .contains("br"));
-        }
-        if cfg!(feature = "deflate") {
-            assert!(req.headers()["accept-encoding"]
-                .to_str()
-                .unwrap()
-                .contains("deflate"));
-        }
+    let url = format!("http://{}/text", server.addr());
+    let mut res = reqwest::get(&url).unwrap();
+    assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"5");
 
-        http::Response::default()
-    });
+    let body = res.text().unwrap();
+    assert_eq!(b"Hello", body.as_bytes());
+}
+
+#[test]
+fn test_response_non_utf_8_text() {
+    let server = server! {
+        request: b"\
+            GET /text HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 4\r\n\
+            Content-Type: text/plain; charset=gbk\r\n\
+            \r\n\
+            \xc4\xe3\xba\xc3\
+            "
+    };
+
+    let url = format!("http://{}/text", server.addr());
+    let mut res = reqwest::get(&url).unwrap();
+    assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"4");
+
+    let body = res.text().unwrap();
+    assert_eq!("你好", &body);
+    assert_eq!(b"\xe4\xbd\xa0\xe5\xa5\xbd", body.as_bytes());  // Now it's utf-8
+}
+
+#[test]
+fn test_response_copy_to() {
+    let server = server! {
+        request: b"\
+            GET /1 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 5\r\n\
+            \r\n\
+            Hello\
+            "
+    };
 
     let url = format!("http://{}/1", server.addr());
-    let res = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
-        .get(&url)
+    let mut res = reqwest::get(&url).unwrap();
+    assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"5");
+
+    let mut buf: Vec<u8> = vec![];
+    res.copy_to(&mut buf).unwrap();
+    assert_eq!(b"Hello", buf.as_slice());
+}
+
+#[test]
+fn test_get() {
+    let server = server! {
+        request: b"\
+            GET /1 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
+
+    let url = format!("http://{}/1", server.addr());
+    let mut res = reqwest::get(&url).unwrap();
+
+    assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"0");
+    assert_eq!(res.remote_addr(), Some(server.addr()));
+
+    let mut buf = [0; 1024];
+    let n = res.read(&mut buf).unwrap();
+    assert_eq!(n, 0)
+}
+
+#[test]
+fn test_post() {
+    let server = server! {
+        request: b"\
+            POST /2 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            content-length: 5\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            Hello\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: post\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
+
+    let url = format!("http://{}/2", server.addr());
+    let mut res = reqwest::Client::new()
+        .post(&url)
+        .body("Hello")
         .send()
-        .await
         .unwrap();
 
     assert_eq!(res.url().as_str(), &url);
     assert_eq!(res.status(), reqwest::StatusCode::OK);
-    assert_eq!(res.remote_addr(), Some(server.addr()));
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"post");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"0");
+
+    let mut buf = [0; 1024];
+    let n = res.read(&mut buf).unwrap();
+    assert_eq!(n, 0)
 }
 
-#[tokio::test]
-async fn user_agent() {
-    let server = server::http(move |req| async move {
-        assert_eq!(req.headers()["user-agent"], "reqwest-test-agent");
-        http::Response::default()
-    });
-
-    let url = format!("http://{}/ua", server.addr());
-    let res = reqwest::Client::builder()
-        .user_agent("reqwest-test-agent")
-        .build()
-        .expect("client builder")
-        .get(&url)
-        .send()
-        .await
-        .expect("request");
-
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-}
-
-#[tokio::test]
-async fn response_text() {
-    let _ = env_logger::try_init();
-
-    let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
-
-    let client = Client::new();
-
-    let res = client
-        .get(&format!("http://{}/text", server.addr()))
-        .send()
-        .await
-        .expect("Failed to get");
-    assert_eq!(res.content_length(), Some(5));
-    let text = res.text().await.expect("Failed to get text");
-    assert_eq!("Hello", text);
-}
-
-#[tokio::test]
-async fn response_bytes() {
-    let _ = env_logger::try_init();
-
-    let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
-
-    let client = Client::new();
-
-    let res = client
-        .get(&format!("http://{}/bytes", server.addr()))
-        .send()
-        .await
-        .expect("Failed to get");
-    assert_eq!(res.content_length(), Some(5));
-    let bytes = res.bytes().await.expect("res.bytes()");
-    assert_eq!("Hello", bytes);
-}
-
-#[tokio::test]
-#[cfg(feature = "json")]
-async fn response_json() {
-    let _ = env_logger::try_init();
-
-    let server = server::http(move |_req| async { http::Response::new("\"Hello\"".into()) });
-
-    let client = Client::new();
-
-    let res = client
-        .get(&format!("http://{}/json", server.addr()))
-        .send()
-        .await
-        .expect("Failed to get");
-    let text = res.json::<String>().await.expect("Failed to get json");
-    assert_eq!("Hello", text);
-}
-
-#[tokio::test]
-async fn body_pipe_response() {
-    let _ = env_logger::try_init();
-
-    let server = server::http(move |mut req| async move {
-        if req.uri() == "/get" {
-            http::Response::new("pipe me".into())
-        } else {
-            assert_eq!(req.uri(), "/pipe");
-            assert_eq!(req.headers()["transfer-encoding"], "chunked");
-
-            let mut full: Vec<u8> = Vec::new();
-            while let Some(item) = req.body_mut().next().await {
-                full.extend(&*item.unwrap());
-            }
-
-            assert_eq!(full, b"pipe me");
-
-            http::Response::default()
-        }
-    });
-
-    let client = Client::new();
-
-    let res1 = client
-        .get(&format!("http://{}/get", server.addr()))
-        .send()
-        .await
-        .expect("get1");
-
-    assert_eq!(res1.status(), reqwest::StatusCode::OK);
-    assert_eq!(res1.content_length(), Some(7));
-
-    // and now ensure we can "pipe" the response to another request
-    let res2 = client
-        .post(&format!("http://{}/pipe", server.addr()))
-        .body(res1)
-        .send()
-        .await
-        .expect("res2");
-
-    assert_eq!(res2.status(), reqwest::StatusCode::OK);
-}
-
-#[tokio::test]
-async fn overridden_dns_resolution_with_gai() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
-
-    let overridden_domain = "rust-lang.org";
-    let url = format!(
-        "http://{}:{}/domain_override",
-        overridden_domain,
-        server.addr().port()
-    );
-    let client = reqwest::Client::builder()
-        .resolve(overridden_domain, server.addr())
-        .build()
-        .expect("client builder");
-    let req = client.get(&url);
-    let res = req.send().await.expect("request");
-
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let text = res.text().await.expect("Failed to get text");
-    assert_eq!("Hello", text);
-}
-
-#[tokio::test]
-async fn overridden_dns_resolution_with_gai_multiple() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
-
-    let overridden_domain = "rust-lang.org";
-    let url = format!(
-        "http://{}:{}/domain_override",
-        overridden_domain,
-        server.addr().port()
-    );
-    // the server runs on IPv4 localhost, so provide both IPv4 and IPv6 and let the happy eyeballs
-    // algorithm decide which address to use.
-    let client = reqwest::Client::builder()
-        .resolve_to_addrs(
-            overridden_domain,
-            &[
-                std::net::SocketAddr::new(
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                    server.addr().port(),
-                ),
-                server.addr(),
-            ],
-        )
-        .build()
-        .expect("client builder");
-    let req = client.get(&url);
-    let res = req.send().await.expect("request");
-
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let text = res.text().await.expect("Failed to get text");
-    assert_eq!("Hello", text);
-}
-
-#[cfg(feature = "trust-dns")]
-#[tokio::test]
-async fn overridden_dns_resolution_with_trust_dns() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
-
-    let overridden_domain = "rust-lang.org";
-    let url = format!(
-        "http://{}:{}/domain_override",
-        overridden_domain,
-        server.addr().port()
-    );
-    let client = reqwest::Client::builder()
-        .resolve(overridden_domain, server.addr())
-        .trust_dns(true)
-        .build()
-        .expect("client builder");
-    let req = client.get(&url);
-    let res = req.send().await.expect("request");
-
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let text = res.text().await.expect("Failed to get text");
-    assert_eq!("Hello", text);
-}
-
-#[cfg(feature = "trust-dns")]
-#[tokio::test]
-async fn overridden_dns_resolution_with_trust_dns_multiple() {
-    let _ = env_logger::builder().is_test(true).try_init();
-    let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
-
-    let overridden_domain = "rust-lang.org";
-    let url = format!(
-        "http://{}:{}/domain_override",
-        overridden_domain,
-        server.addr().port()
-    );
-    // the server runs on IPv4 localhost, so provide both IPv4 and IPv6 and let the happy eyeballs
-    // algorithm decide which address to use.
-    let client = reqwest::Client::builder()
-        .resolve_to_addrs(
-            overridden_domain,
-            &[
-                std::net::SocketAddr::new(
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                    server.addr().port(),
-                ),
-                server.addr(),
-            ],
-        )
-        .trust_dns(true)
-        .build()
-        .expect("client builder");
-    let req = client.get(&url);
-    let res = req.send().await.expect("request");
-
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let text = res.text().await.expect("Failed to get text");
-    assert_eq!("Hello", text);
-}
-
-#[cfg(any(feature = "native-tls", feature = "__rustls",))]
 #[test]
-fn use_preconfigured_tls_with_bogus_backend() {
-    struct DefinitelyNotTls;
+fn test_post_form() {
+    let server = server! {
+        request: b"\
+            POST /form HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            content-type: application/x-www-form-urlencoded\r\n\
+            content-length: 24\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            hello=world&sean=monstar\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: post-form\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
 
-    reqwest::Client::builder()
-        .use_preconfigured_tls(DefinitelyNotTls)
-        .build()
-        .expect_err("definitely is not TLS");
-}
+    let form = &[("hello", "world"), ("sean", "monstar")];
 
-#[cfg(feature = "native-tls")]
-#[test]
-fn use_preconfigured_native_tls_default() {
-    extern crate native_tls_crate;
-
-    let tls = native_tls_crate::TlsConnector::builder()
-        .build()
-        .expect("tls builder");
-
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .build()
-        .expect("preconfigured default tls");
-}
-
-#[cfg(feature = "__rustls")]
-#[test]
-fn use_preconfigured_rustls_default() {
-    extern crate rustls;
-
-    let root_cert_store = rustls::RootCertStore::empty();
-    let tls = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_cert_store)
-        .with_no_client_auth();
-
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .build()
-        .expect("preconfigured rustls tls");
-}
-
-#[cfg(feature = "__rustls")]
-#[tokio::test]
-#[ignore = "Needs TLS support in the test server"]
-async fn http2_upgrade() {
-    let server = server::http(move |_| async move { http::Response::default() });
-
-    let url = format!("https://localhost:{}", server.addr().port());
-    let res = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .use_rustls_tls()
-        .build()
-        .expect("client builder")
-        .get(&url)
+    let url = format!("http://{}/form", server.addr());
+    let res = reqwest::Client::new()
+        .post(&url)
+        .form(form)
         .send()
-        .await
-        .expect("request");
+        .expect("request send");
 
+    assert_eq!(res.url().as_str(), &url);
     assert_eq!(res.status(), reqwest::StatusCode::OK);
-    assert_eq!(res.version(), reqwest::Version::HTTP_2);
 }
 
-#[cfg(feature = "default-tls")]
-#[tokio::test]
-async fn test_allowed_methods() {
-    let resp = reqwest::Client::builder()
-        .https_only(true)
-        .build()
-        .expect("client builder")
-        .get("https://google.com")
-        .send()
-        .await;
+/// Calling `Response::error_for_status`` on a response with status in 4xx
+/// returns a error.
+#[test]
+fn test_error_for_status_4xx() {
+    let server = server! {
+        request: b"\
+            GET /1 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 400 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
 
-    assert!(resp.is_ok());
+    let url = format!("http://{}/1", server.addr());
+    let res = reqwest::get(&url).unwrap();
 
-    let resp = reqwest::Client::builder()
-        .https_only(true)
-        .build()
-        .expect("client builder")
-        .get("http://google.com")
-        .send()
-        .await;
+    let err = res.error_for_status().err().unwrap();
+    assert!(err.is_client_error());
+    assert_eq!(err.status(), Some(reqwest::StatusCode::BAD_REQUEST));
+}
 
-    assert!(resp.is_err());
+/// Calling `Response::error_for_status`` on a response with status in 5xx
+/// returns a error.
+#[test]
+fn test_error_for_status_5xx() {
+    let server = server! {
+        request: b"\
+            GET /1 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 500 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
+
+    let url = format!("http://{}/1", server.addr());
+    let res = reqwest::get(&url).unwrap();
+
+    let err = res.error_for_status().err().unwrap();
+    assert!(err.is_server_error());
+    assert_eq!(err.status(), Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+}
+
+#[test]
+fn test_default_headers() {
+    use reqwest::header;
+    let mut headers = header::HeaderMap::with_capacity(1);
+    headers.insert(header::COOKIE, header::HeaderValue::from_static("a=b;c=d"));
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build().unwrap();
+
+    let server = server! {
+        request: b"\
+            GET /1 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            cookie: a=b;c=d\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
+
+    let url = format!("http://{}/1", server.addr());
+    let res = client.get(&url).send().unwrap();
+
+    assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"0");
+
+    let server = server! {
+        request: b"\
+            GET /2 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            cookie: a=b;c=d\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
+
+    let url = format!("http://{}/2", server.addr());
+    let res = client.get(&url).send().unwrap();
+
+    assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"0");
+}
+
+#[test]
+fn test_override_default_headers() {
+    use reqwest::header;
+    let mut headers = header::HeaderMap::with_capacity(1);
+    headers.insert(header::AUTHORIZATION, header::HeaderValue::from_static("iamatoken"));
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build().unwrap();
+
+    let server = server! {
+        request: b"\
+            GET /3 HTTP/1.1\r\n\
+            user-agent: $USERAGENT\r\n\
+            accept: */*\r\n\
+            authorization: secret\r\n\
+            accept-encoding: gzip\r\n\
+            host: $HOST\r\n\
+            \r\n\
+            ",
+        response: b"\
+            HTTP/1.1 200 OK\r\n\
+            Server: test\r\n\
+            Content-Length: 0\r\n\
+            \r\n\
+            "
+    };
+
+    let url = format!("http://{}/3", server.addr());
+    let res = client.get(&url).header(header::AUTHORIZATION, header::HeaderValue::from_static("secret")).send().unwrap();
+
+    assert_eq!(res.url().as_str(), &url);
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"0");
+
 }
