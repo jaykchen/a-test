@@ -3,9 +3,9 @@
 //! In contrast to the arbitrary JSON example, this brings up the full power of
 //! Rust compile-time type system guaranties though it requires a little bit
 //! more code.
-
-// These require the `serde` dependency.
-use serde::{Deserialize, Serialize};
+extern crate reqwest;
+#[macro_use] extern crate serde_derive;
+extern crate serde_json;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Post {
@@ -16,24 +16,18 @@ struct Post {
     user_id: i32,
 }
 
-// This is using the `tokio` runtime. You'll need the following dependency:
-//
-// `tokio = { version = "1", features = ["full"] }`
-#[tokio::main]
-async fn main() -> Result<(), reqwest::Error> {
+fn main() -> Result<(), reqwest::Error> {
     let new_post = Post {
         id: None,
         title: "Reqwest.rs".into(),
         body: "https://docs.rs/reqwest".into(),
-        user_id: 1,
+        user_id: 1
     };
     let new_post: Post = reqwest::Client::new()
         .post("https://jsonplaceholder.typicode.com/posts")
         .json(&new_post)
-        .send()
-        .await?
-        .json()
-        .await?;
+        .send()?
+        .json()?;
 
     println!("{:#?}", new_post);
     // Post {
