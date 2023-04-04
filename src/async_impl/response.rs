@@ -1,72 +1,100 @@
+use std::borrow::Cow;
 use std::fmt;
-use std::mem;
-use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::pin::Pin;
 
-use futures::{Async, Future, Poll, Stream};
-use futures::stream::Concat2;
-use hyper::{HeaderMap, StatusCode, Version};
+use bytes::Bytes;
+use encoding_rs::{Encoding, UTF_8};
+use futures_util::stream::StreamExt;
 use hyper::client::connect::HttpInfo;
-use hyper::header::{CONTENT_LENGTH};
+use hyper::{HeaderMap, StatusCode, Version};
+use mime::Mime;
+#[cfg(feature = "json")]
 use serde::de::DeserializeOwned;
+#[cfg(feature = "json")]
 use serde_json;
+use tokio::time::Sleep;
 use url::Url;
-use http;
 
-use super::Decoder;
 use super::body::Body;
-
+use super::decoder::{Accepts, Decoder};
+#[cfg(feature = "cookies")]
+use crate::cookie;
+use crate::response::ResponseUrl;
 
 /// A Response to a submitted `Request`.
 pub struct Response {
-    status: StatusCode,
-    headers: HeaderMap,
+    pub(super) res: hyper::Response<Decoder>,
     // Boxed to save space (11 words to 1 word), and it's not accessed
     // frequently internally.
     url: Box<Url>,
-    body: Decoder,
-    version: Version,
-    extensions: http::Extensions,
 }
 
 impl Response {
-    pub(super) fn new(res: ::hyper::Response<::hyper::Body>, url: Url, gzip: bool) -> Response {
-        let (parts, body) = res.into_parts();
-        let status = parts.status;
-        let version = parts.version;
-        let extensions = parts.extensions;
+    pub(super) fn new(
+        res: hyper::Response<hyper::Body>,
+        url: Url,
+        accepts: Accepts,
+        timeout: Option<Pin<Box<Sleep>>>,
+    ) -> Response {
+        let (mut parts, body) = res.into_parts();
+        let decoder = Decoder::detect(&mut parts.headers, Body::response(body, timeout), accepts);
+        let res = hyper::Response::from_parts(parts, decoder);
 
-        let mut headers = parts.headers;
-        let decoder = Decoder::detect(&mut headers, Body::wrap(body), gzip);
-
-        debug!("Response: '{}' for {}", status, url);
         Response {
-            status,
-            headers,
+            res,
             url: Box::new(url),
-            body: decoder,
-            version,
-            extensions,
         }
     }
-
 
     /// Get the `StatusCode` of this `Response`.
     #[inline]
     pub fn status(&self) -> StatusCode {
-        self.status
+        self.res.status()
+    }
+
+    /// Get the HTTP `Version` of this `Response`.
+    #[inline]
+    pub fn version(&self) -> Version {
+        self.res.version()
     }
 
     /// Get the `Headers` of this `Response`.
     #[inline]
     pub fn headers(&self) -> &HeaderMap {
-        &self.headers
+        self.res.headers()
     }
 
     /// Get a mutable reference to the `Headers` of this `Response`.
     #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
-        &mut self.headers
+        self.res.headers_mut()
+    }
+
+    /// Get the content-length of this response, if known.
+    ///
+    /// Reasons it may not be known:
+    ///
+    /// - The server didn't send a `content-length` header.
+    /// - The response is compressed and automatically decoded (thus changing
+    ///   the actual decoded length).
+    pub fn content_length(&self) -> Option<u64> {
+        use hyper::body::HttpBody;
+
+        HttpBody::size_hint(self.res.body()).exact()
+    }
+
+    /// Retrieve the cookies contained in the response.
+    ///
+    /// Note that invalid 'Set-Cookie' headers will be ignored.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `cookies` feature to be enabled.
+    #[cfg(feature = "cookies")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cookies")))]
+    pub fn cookies<'a>(&'a self) -> impl Iterator<Item = cookie::Cookie<'a>> + 'a {
+        cookie::extract_response_cookies(self.res.headers()).filter_map(Result::ok)
     }
 
     /// Get the final `Url` of this `Response`.
@@ -77,71 +105,224 @@ impl Response {
 
     /// Get the remote address used to get this `Response`.
     pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self
-            .extensions
+        self.res
+            .extensions()
             .get::<HttpInfo>()
             .map(|info| info.remote_addr())
     }
 
-    /// Get the content-length of this response, if known.
+    /// Returns a reference to the associated extensions.
+    pub fn extensions(&self) -> &http::Extensions {
+        self.res.extensions()
+    }
+
+    /// Returns a mutable reference to the associated extensions.
+    pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+        self.res.extensions_mut()
+    }
+
+    // body methods
+
+    /// Get the full response text.
     ///
-    /// Reasons it may not be known:
+    /// This method decodes the response body with BOM sniffing
+    /// and with malformed sequences replaced with the REPLACEMENT CHARACTER.
+    /// Encoding is determined from the `charset` parameter of `Content-Type` header,
+    /// and defaults to `utf-8` if not presented.
     ///
-    /// - The server didn't send a `content-length` header.
-    /// - The response is gzipped and automatically decoded (thus changing
-    ///   the actual decoded length).
-    pub fn content_length(&self) -> Option<u64> {
-        self
+    /// # Example
+    ///
+    /// ```
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let content = reqwest::get("http://httpbin.org/range/26")
+    ///     .await?
+    ///     .text()
+    ///     .await?;
+    ///
+    /// println!("text: {:?}", content);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn text(self) -> crate::Result<String> {
+        self.text_with_charset("utf-8").await
+    }
+
+    /// Get the full response text given a specific encoding.
+    ///
+    /// This method decodes the response body with BOM sniffing
+    /// and with malformed sequences replaced with the REPLACEMENT CHARACTER.
+    /// You can provide a default encoding for decoding the raw message, while the
+    /// `charset` parameter of `Content-Type` header is still prioritized. For more information
+    /// about the possible encoding name, please go to [`encoding_rs`] docs.
+    ///
+    /// [`encoding_rs`]: https://docs.rs/encoding_rs/0.8/encoding_rs/#relationship-with-windows-code-pages
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let content = reqwest::get("http://httpbin.org/range/26")
+    ///     .await?
+    ///     .text_with_charset("utf-8")
+    ///     .await?;
+    ///
+    /// println!("text: {:?}", content);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn text_with_charset(self, default_encoding: &str) -> crate::Result<String> {
+        let content_type = self
             .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|ct_len| ct_len.to_str().ok())
-            .and_then(|ct_len| ct_len.parse().ok())
-    }
+            .get(crate::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<Mime>().ok());
+        let encoding_name = content_type
+            .as_ref()
+            .and_then(|mime| mime.get_param("charset").map(|charset| charset.as_str()))
+            .unwrap_or(default_encoding);
+        let encoding = Encoding::for_label(encoding_name.as_bytes()).unwrap_or(UTF_8);
 
-    /// Consumes the response, returning the body
-    pub fn into_body(self) -> Decoder {
-        self.body
-    }
+        let full = self.bytes().await?;
 
-    /// Get a reference to the response body.
-    #[inline]
-    pub fn body(&self) -> &Decoder {
-        &self.body
-    }
-
-    /// Get a mutable reference to the response body.
-    ///
-    /// The chunks from the body may be decoded, depending on the `gzip`
-    /// option on the `ClientBuilder`.
-    #[inline]
-    pub fn body_mut(&mut self) -> &mut Decoder {
-        &mut self.body
-    }
-
-    /// Get the HTTP `Version` of this `Response`.
-    #[inline]
-    pub fn version(&self) -> Version {
-        self.version
-    }
-
-
-    /// Try to deserialize the response body as JSON using `serde`.
-    #[inline]
-    pub fn json<T: DeserializeOwned>(&mut self) -> impl Future<Item = T, Error = ::Error> {
-        let body = mem::replace(&mut self.body, Decoder::empty());
-
-        Json {
-            concat: body.concat2(),
-            _marker: PhantomData,
+        let (text, _, _) = encoding.decode(&full);
+        if let Cow::Owned(s) = text {
+            return Ok(s);
+        }
+        unsafe {
+            // decoding returned Cow::Borrowed, meaning these bytes
+            // are already valid utf8
+            Ok(String::from_utf8_unchecked(full.to_vec()))
         }
     }
+
+    /// Try to deserialize the response body as JSON.
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `json` feature enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # extern crate reqwest;
+    /// # extern crate serde;
+    /// #
+    /// # use reqwest::Error;
+    /// # use serde::Deserialize;
+    /// #
+    /// // This `derive` requires the `serde` dependency.
+    /// #[derive(Deserialize)]
+    /// struct Ip {
+    ///     origin: String,
+    /// }
+    ///
+    /// # async fn run() -> Result<(), Error> {
+    /// let ip = reqwest::get("http://httpbin.org/ip")
+    ///     .await?
+    ///     .json::<Ip>()
+    ///     .await?;
+    ///
+    /// println!("ip: {}", ip.origin);
+    /// # Ok(())
+    /// # }
+    /// #
+    /// # fn main() { }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method fails whenever the response body is not in JSON format
+    /// or it cannot be properly deserialized to target type `T`. For more
+    /// details please see [`serde_json::from_reader`].
+    ///
+    /// [`serde_json::from_reader`]: https://docs.serde.rs/serde_json/fn.from_reader.html
+    #[cfg(feature = "json")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
+    pub async fn json<T: DeserializeOwned>(self) -> crate::Result<T> {
+        let full = self.bytes().await?;
+
+        serde_json::from_slice(&full).map_err(crate::error::decode)
+    }
+
+    /// Get the full response body as `Bytes`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let bytes = reqwest::get("http://httpbin.org/ip")
+    ///     .await?
+    ///     .bytes()
+    ///     .await?;
+    ///
+    /// println!("bytes: {:?}", bytes);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn bytes(self) -> crate::Result<Bytes> {
+        hyper::body::to_bytes(self.res.into_body()).await
+    }
+
+    /// Stream a chunk of the response body.
+    ///
+    /// When the response body has been exhausted, this will return `None`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut res = reqwest::get("https://hyper.rs").await?;
+    ///
+    /// while let Some(chunk) = res.chunk().await? {
+    ///     println!("Chunk: {:?}", chunk);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn chunk(&mut self) -> crate::Result<Option<Bytes>> {
+        if let Some(item) = self.res.body_mut().next().await {
+            Ok(Some(item?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Convert the response into a `Stream` of `Bytes` from the body.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use futures_util::StreamExt;
+    ///
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut stream = reqwest::get("http://httpbin.org/ip")
+    ///     .await?
+    ///     .bytes_stream();
+    ///
+    /// while let Some(item) = stream.next().await {
+    ///     println!("Chunk: {:?}", item?);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Optional
+    ///
+    /// This requires the optional `stream` feature to be enabled.
+    #[cfg(feature = "stream")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "stream")))]
+    pub fn bytes_stream(self) -> impl futures_core::Stream<Item = crate::Result<Bytes>> {
+        self.res.into_body()
+    }
+
+    // util methods
 
     /// Turn a response into an error if the server returned an error.
     ///
     /// # Example
     ///
     /// ```
-    /// # use reqwest::async::Response;
+    /// # use reqwest::Response;
     /// fn on_response(res: Response) {
     ///     match res.error_for_status() {
     ///         Ok(_res) => (),
@@ -157,12 +338,10 @@ impl Response {
     /// }
     /// # fn main() {}
     /// ```
-    #[inline]
-    pub fn error_for_status(self) -> ::Result<Self> {
-        if self.status.is_client_error() {
-            Err(::error::client_error(*self.url, self.status))
-        } else if self.status.is_server_error() {
-            Err(::error::server_error(*self.url, self.status))
+    pub fn error_for_status(self) -> crate::Result<Self> {
+        let status = self.status();
+        if status.is_client_error() || status.is_server_error() {
+            Err(crate::error::status_code(*self.url, status))
         } else {
             Ok(self)
         }
@@ -173,7 +352,7 @@ impl Response {
     /// # Example
     ///
     /// ```
-    /// # use reqwest::async::Response;
+    /// # use reqwest::Response;
     /// fn on_response(res: &Response) {
     ///     match res.error_for_status_ref() {
     ///         Ok(_res) => (),
@@ -189,15 +368,25 @@ impl Response {
     /// }
     /// # fn main() {}
     /// ```
-    #[inline]
-    pub fn error_for_status_ref(&self) -> ::Result<&Self> {
-        if self.status.is_client_error() {
-            Err(::error::client_error(*self.url.clone(), self.status))
-        } else if self.status.is_server_error() {
-            Err(::error::server_error(*self.url.clone(), self.status))
+    pub fn error_for_status_ref(&self) -> crate::Result<&Self> {
+        let status = self.status();
+        if status.is_client_error() || status.is_server_error() {
+            Err(crate::error::status_code(*self.url.clone(), status))
         } else {
             Ok(self)
         }
+    }
+
+    // private
+
+    // The Response's body is an implementation detail.
+    // You no longer need to get a reference to it, there are async methods
+    // on the `Response` itself.
+    //
+    // This method is just used by the blocking API.
+    #[cfg(feature = "blocking")]
+    pub(crate) fn body_mut(&mut self) -> &mut Decoder {
+        self.res.body_mut()
     }
 }
 
@@ -215,99 +404,33 @@ impl<T: Into<Body>> From<http::Response<T>> for Response {
     fn from(r: http::Response<T>) -> Response {
         let (mut parts, body) = r.into_parts();
         let body = body.into();
-        let body = Decoder::detect(&mut parts.headers, body, false);
-        let url = parts.extensions
+        let decoder = Decoder::detect(&mut parts.headers, body, Accepts::none());
+        let url = parts
+            .extensions
             .remove::<ResponseUrl>()
             .unwrap_or_else(|| ResponseUrl(Url::parse("http://no.url.provided.local").unwrap()));
         let url = url.0;
+        let res = hyper::Response::from_parts(parts, decoder);
         Response {
-            status: parts.status,
-            headers: parts.headers,
+            res,
             url: Box::new(url),
-            body: body,
-            version: parts.version,
-            extensions: parts.extensions,
         }
     }
 }
 
-/// A JSON object.
-pub struct Json<T> {
-    concat: Concat2<Decoder>,
-    _marker: PhantomData<T>,
-}
-
-impl<T: DeserializeOwned> Future for Json<T> {
-    type Item = T;
-    type Error = ::Error;
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let bytes = try_ready!(self.concat.poll());
-        let t = try_!(serde_json::from_slice(&bytes));
-        Ok(Async::Ready(t))
-    }
-}
-
-impl<T> fmt::Debug for Json<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Json")
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ResponseUrl(Url);
-
-/// Extension trait for http::response::Builder objects
-///
-/// Allows the user to add a `Url` to the http::Response
-pub trait ResponseBuilderExt {
-    /// A builder method for the `http::response::Builder` type that allows the user to add a `Url`
-    /// to the `http::Response`
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # extern crate url;
-    /// # extern crate http;
-    /// # extern crate reqwest;
-    /// # use std::error::Error;
-    /// use url::Url;
-    /// use http::response::Builder;
-    /// use reqwest::async::ResponseBuilderExt;
-    /// # fn main() -> Result<(), Box<Error>> {
-    /// let response = Builder::new()
-    ///     .status(200)
-    ///     .url(Url::parse("http://example.com")?)
-    ///     .body(())?;
-    ///
-    /// #   Ok(())
-    /// # }
-    fn url(&mut self, url: Url) -> &mut Self;
-}
-
-impl ResponseBuilderExt for http::response::Builder {
-    fn url(&mut self, url: Url) -> &mut Self {
-        self.extension(ResponseUrl(url))
+/// A `Response` can be piped as the `Body` of another request.
+impl From<Response> for Body {
+    fn from(r: Response) -> Body {
+        Body::stream(r.res.into_body())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use url::Url;
+    use super::Response;
+    use crate::ResponseBuilderExt;
     use http::response::Builder;
-    use super::{Response, ResponseUrl, ResponseBuilderExt};
-
-    #[test]
-    fn test_response_builder_ext() {
-        let url = Url::parse("http://example.com").unwrap();
-        let response = Builder::new()
-            .status(200)
-            .url(url.clone())
-            .body(())
-            .unwrap();
-
-        assert_eq!(response.extensions().get::<ResponseUrl>(), Some(&ResponseUrl(url)));
-    }
+    use url::Url;
 
     #[test]
     fn test_from_http_response() {
@@ -319,7 +442,7 @@ mod tests {
             .unwrap();
         let response = Response::from(response);
 
-        assert_eq!(response.status, 200);
-        assert_eq!(response.url, Box::new(url));
+        assert_eq!(response.status(), 200);
+        assert_eq!(*response.url(), url);
     }
 }

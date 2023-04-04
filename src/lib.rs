@@ -1,7 +1,8 @@
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(test, deny(warnings))]
-#![doc(html_root_url = "https://docs.rs/reqwest/0.9.10")]
+#![doc(html_root_url = "https://docs.rs/reqwest/0.11.15")]
 
 //! # reqwest
 //!
@@ -11,20 +12,16 @@
 //! It handles many of the things that most people just expect an HTTP client
 //! to do for them.
 //!
+//! - Async and [blocking](blocking) Clients
 //! - Plain bodies, [JSON](#json), [urlencoded](#forms), [multipart](multipart)
-//! - Customizable [redirect policy](#redirect-policy)
+//! - Customizable [redirect policy](#redirect-policies)
 //! - HTTP [Proxies](#proxies)
 //! - Uses system-native [TLS](#tls)
-//! - Cookies (only rudimentary support, full support is TODO)
+//! - Cookies
 //!
-//! The rudimentary cookie support means that the cookies need to be manually
-//! configured for every single request. In other words, there's no cookie jar
-//! support as of now. The tracking issue for this feature is available
-//! [on GitHub][cookiejar_issue].
-//!
-//! The [`reqwest::Client`][client] is synchronous, making it a great fit for
-//! applications that only require a few HTTP requests, and wish to handle
-//! them synchronously.
+//! The [`reqwest::Client`][client] is asynchronous. For applications wishing
+//! to only make a few HTTP requests, the [`reqwest::blocking`](blocking) API
+//! may be more convenient.
 //!
 //! Additional learning resources include:
 //!
@@ -36,21 +33,16 @@
 //! For a single request, you can use the [`get`][get] shortcut method.
 //!
 //! ```rust
-//! # use reqwest::{Error, Response};
-//!
-//! # fn run() -> Result<(), Error> {
-//! let body = reqwest::get("https://www.rust-lang.org")?
-//!     .text()?;
+//! # async fn run() -> Result<(), reqwest::Error> {
+//! let body = reqwest::get("https://www.rust-lang.org")
+//!     .await?
+//!     .text()
+//!     .await?;
 //!
 //! println!("body = {:?}", body);
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! Additionally, reqwest's [`Response`][response] struct implements Rust's
-//! `Read` trait, so many useful standard library and third party crates will
-//! have convenience methods that take a `Response` anywhere `T: Read` is
-//! acceptable.
 //!
 //! **NOTE**: If you plan to perform multiple requests, it is best to create a
 //! [`Client`][client] and reuse it, taking advantage of keep-alive connection
@@ -61,17 +53,18 @@
 //! There are several ways you can set the body of a request. The basic one is
 //! by using the `body()` method of a [`RequestBuilder`][builder]. This lets you set the
 //! exact raw bytes of what the body should be. It accepts various types,
-//! including `String`, `Vec<u8>`, and `File`. If you wish to pass a custom
-//! Reader, you can use the `reqwest::Body::new()` constructor.
+//! including `String` and `Vec<u8>`. If you wish to pass a custom
+//! type, you can use the `reqwest::Body` constructors.
 //!
 //! ```rust
 //! # use reqwest::Error;
 //! #
-//! # fn run() -> Result<(), Error> {
+//! # async fn run() -> Result<(), Error> {
 //! let client = reqwest::Client::new();
 //! let res = client.post("http://httpbin.org/post")
 //!     .body("the exact body that is sent")
-//!     .send()?;
+//!     .send()
+//!     .await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -87,13 +80,14 @@
 //! ```rust
 //! # use reqwest::Error;
 //! #
-//! # fn run() -> Result<(), Error> {
+//! # async fn run() -> Result<(), Error> {
 //! // This will POST a body of `foo=bar&baz=quux`
 //! let params = [("foo", "bar"), ("baz", "quux")];
 //! let client = reqwest::Client::new();
 //! let res = client.post("http://httpbin.org/post")
 //!     .form(&params)
-//!     .send()?;
+//!     .send()
+//!     .await?;
 //! # Ok(())
 //! # }
 //! ```
@@ -102,13 +96,14 @@
 //!
 //! There is also a `json` method helper on the [`RequestBuilder`][builder] that works in
 //! a similar fashion the `form` method. It can take any value that can be
-//! serialized into JSON.
+//! serialized into JSON. The feature `json` is required.
 //!
 //! ```rust
 //! # use reqwest::Error;
 //! # use std::collections::HashMap;
 //! #
-//! # fn run() -> Result<(), Error> {
+//! # #[cfg(feature = "json")]
+//! # async fn run() -> Result<(), Error> {
 //! // This will POST a body of `{"lang":"rust","body":"json"}`
 //! let mut map = HashMap::new();
 //! map.insert("lang", "rust");
@@ -117,21 +112,41 @@
 //! let client = reqwest::Client::new();
 //! let res = client.post("http://httpbin.org/post")
 //!     .json(&map)
-//!     .send()?;
+//!     .send()
+//!     .await?;
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! ## Redirect Policies
 //!
-//! By default, a `Client` will automatically handle HTTP redirects, detecting
-//! loops, and having a maximum redirect chain of 10 hops. To customize this
-//! behavior, a [`RedirectPolicy`][redirect] can used with a `ClientBuilder`.
+//! By default, a `Client` will automatically handle HTTP redirects, having a
+//! maximum redirect chain of 10 hops. To customize this behavior, a
+//! [`redirect::Policy`][redirect] can be used with a `ClientBuilder`.
+//!
+//! ## Cookies
+//!
+//! The automatic storing and sending of session cookies can be enabled with
+//! the [`cookie_store`][ClientBuilder::cookie_store] method on `ClientBuilder`.
 //!
 //! ## Proxies
 //!
-//! A `Client` can be configured to make use of HTTP proxies by adding
-//! [`Proxy`](Proxy)s to a `ClientBuilder`.
+//! **NOTE**: System proxies are enabled by default.
+//!
+//! System proxies look in environment variables to set HTTP or HTTPS proxies.
+//!
+//! `HTTP_PROXY` or `http_proxy` provide http proxies for http connections while
+//! `HTTPS_PROXY` or `https_proxy` provide HTTPS proxies for HTTPS connections.
+//!
+//! These can be overwritten by adding a [`Proxy`](Proxy) to `ClientBuilder`
+//! i.e. `let proxy = reqwest::Proxy::http("https://secure.example")?;`
+//! or disabled by calling `ClientBuilder::no_proxy()`.
+//!
+//! `socks` feature is required if you have configured socks proxy like this:
+//!
+//! ```bash
+//! export https_proxy=socks5://127.0.0.1:1086
+//! ```
 //!
 //! ## TLS
 //!
@@ -139,9 +154,9 @@
 //! security to connect to HTTPS destinations. This means schannel on Windows,
 //! Security-Framework on macOS, and OpenSSL on Linux.
 //!
-//! - Additional X509 certicates can be configured on a `ClientBuilder` with the
+//! - Additional X509 certificates can be configured on a `ClientBuilder` with the
 //!   [`Certificate`](Certificate) type.
-//! - Client certificates can be add to a `ClientBuilder` with the
+//! - Client certificates can be added to a `ClientBuilder` with the
 //!   [`Identity`][Identity] type.
 //! - Various parts of TLS can also be configured or even disabled on the
 //!   `ClientBuilder`.
@@ -151,123 +166,95 @@
 //! The following are a list of [Cargo features][cargo-features] that can be
 //! enabled or disabled:
 //!
-//! - **default-tls** *(enabled by default)*: Provides TLS support via the
-//!   `native-tls` library to connect over HTTPS.
-//! - **default-tls-vendored**: Enables the `vendored` feature of `native-tls`.
-//! - **rustls-tls**: Provides TLS support via the `rustls` library.
+//! - **default-tls** *(enabled by default)*: Provides TLS support to connect
+//!   over HTTPS.
+//! - **native-tls**: Enables TLS functionality provided by `native-tls`.
+//! - **native-tls-vendored**: Enables the `vendored` feature of `native-tls`.
+//! - **native-tls-alpn**: Enables the `alpn` feature of `native-tls`.
+//! - **rustls-tls**: Enables TLS functionality provided by `rustls`.
+//!   Equivalent to `rustls-tls-webpki-roots`.
+//! - **rustls-tls-manual-roots**: Enables TLS functionality provided by `rustls`,
+//!   without setting any root certificates. Roots have to be specified manually.
+//! - **rustls-tls-webpki-roots**: Enables TLS functionality provided by `rustls`,
+//!   while using root certificates from the `webpki-roots` crate.
+//! - **rustls-tls-native-roots**: Enables TLS functionality provided by `rustls`,
+//!   while using root certificates from the `rustls-native-certs` crate.
+//! - **blocking**: Provides the [blocking][] client API.
+//! - **cookies**: Provides cookie session support.
+//! - **gzip**: Provides response body gzip decompression.
+//! - **brotli**: Provides response body brotli decompression.
+//! - **deflate**: Provides response body deflate decompression.
+//! - **json**: Provides serialization and deserialization for JSON bodies.
+//! - **multipart**: Provides functionality for multipart forms.
+//! - **stream**: Adds support for `futures::Stream`.
+//! - **socks**: Provides SOCKS5 proxy support.
 //! - **trust-dns**: Enables a trust-dns async resolver instead of default
 //!   threadpool using `getaddrinfo`.
-//! - **hyper-011**: Provides support for hyper's old typed headers.
 //!
+//! ## Unstable Features
+//!
+//! Some feature flags require additional opt-in by the application, by setting
+//! a `reqwest_unstable` flag.
+//!
+//! - **http3** *(unstable)*: Enables support for sending HTTP/3 requests.
+//!
+//! These features are unstable, and experimental. Details about them may be
+//! changed in patch releases.
+//!
+//! You can pass such a flag to the compiler via `.cargo/config`, or
+//! environment variables, such as:
+//!
+//! ```notrust
+//! RUSTFLAGS="--cfg reqwest_unstable" cargo build
+//! ```
 //!
 //! [hyper]: http://hyper.rs
+//! [blocking]: ./blocking/index.html
 //! [client]: ./struct.Client.html
 //! [response]: ./struct.Response.html
 //! [get]: ./fn.get.html
 //! [builder]: ./struct.RequestBuilder.html
 //! [serde]: http://serde.rs
-//! [cookiejar_issue]: https://github.com/seanmonstar/reqwest/issues/14
-//! [redirect]: ./struct.RedirectPolicy.html
+//! [redirect]: crate::redirect
 //! [Proxy]: ./struct.Proxy.html
 //! [cargo-features]: https://doc.rust-lang.org/stable/cargo/reference/manifest.html#the-features-section
 
-extern crate base64;
-extern crate bytes;
-extern crate encoding_rs;
-#[macro_use]
-extern crate futures;
-extern crate http;
-extern crate hyper;
-#[cfg(feature = "hyper-011")]
-pub extern crate hyper_old_types as hyper_011;
-#[cfg(feature = "default-tls")]
-extern crate hyper_tls;
-#[macro_use]
-extern crate log;
-extern crate libflate;
-extern crate mime;
-extern crate mime_guess;
-#[cfg(feature = "default-tls")]
-extern crate native_tls;
-extern crate serde;
-#[cfg(test)]
-#[macro_use]
-extern crate serde_derive;
-extern crate serde_json;
-extern crate serde_urlencoded;
-extern crate tokio;
-#[cfg_attr(feature = "default-tls", macro_use)]
-extern crate tokio_io;
-#[cfg(feature = "trust-dns")]
-extern crate trust_dns_resolver;
-extern crate url;
-extern crate uuid;
+#[cfg(all(feature = "http3", not(reqwest_unstable)))]
+compile_error!(
+    "\
+    The `http3` feature is unstable, and requires the \
+    `RUSTFLAGS='--cfg reqwest_unstable'` environment variable to be set.\
+"
+);
 
-#[cfg(feature = "rustls-tls")]
-extern crate hyper_rustls;
-#[cfg(feature = "rustls-tls")]
-extern crate tokio_rustls;
-#[cfg(feature = "rustls-tls")]
-extern crate webpki_roots;
-#[cfg(feature = "rustls-tls")]
-extern crate rustls;
+macro_rules! if_wasm {
+    ($($item:item)*) => {$(
+        #[cfg(target_arch = "wasm32")]
+        $item
+    )*}
+}
 
-pub use hyper::header;
-pub use hyper::Method;
-pub use hyper::{StatusCode, Version};
+macro_rules! if_hyper {
+    ($($item:item)*) => {$(
+        #[cfg(not(target_arch = "wasm32"))]
+        $item
+    )*}
+}
+
+pub use http::header;
+pub use http::Method;
+pub use http::{StatusCode, Version};
 pub use url::Url;
-pub use url::ParseError as UrlError;
 
-pub use self::client::{Client, ClientBuilder};
-pub use self::error::{Error, Result};
-pub use self::body::Body;
-pub use self::into_url::IntoUrl;
-pub use self::proxy::Proxy;
-pub use self::redirect::{RedirectAction, RedirectAttempt, RedirectPolicy};
-pub use self::request::{Request, RequestBuilder};
-pub use self::response::Response;
-#[cfg(feature = "tls")]
-pub use self::tls::{Certificate, Identity};
-
-
-// this module must be first because of the `try_` macro
+// universal mods
 #[macro_use]
 mod error;
-
-mod async_impl;
-mod connect;
-#[cfg(feature = "default-tls")]
-mod connect_async;
-mod body;
-mod client;
-#[cfg(feature = "trust-dns")]
-mod dns;
 mod into_url;
-mod proxy;
-mod redirect;
-mod request;
 mod response;
-#[cfg(feature = "tls")]
-mod tls;
-mod wait;
 
-pub mod multipart;
-
-/// An 'async' implementation of the reqwest `Client`.
-pub mod async {
-    pub use ::async_impl::{
-        Body,
-        Chunk,
-        Decoder,
-        Client,
-        ClientBuilder,
-        Request,
-        RequestBuilder,
-        Response,
-        ResponseBuilderExt,
-        multipart
-    };
-}
+pub use self::error::{Error, Result};
+pub use self::into_url::IntoUrl;
+pub use self::response::ResponseBuilderExt;
 
 /// Shortcut method to quickly make a `GET` request.
 ///
@@ -281,12 +268,11 @@ pub mod async {
 /// # Examples
 ///
 /// ```rust
-/// # fn run() -> Result<(), reqwest::Error> {
-/// let body = reqwest::get("https://www.rust-lang.org")?
-///     .text()?;
+/// # async fn run() -> Result<(), reqwest::Error> {
+/// let body = reqwest::get("https://www.rust-lang.org").await?
+///     .text().await?;
 /// # Ok(())
 /// # }
-/// # fn main() { }
 /// ```
 ///
 /// # Errors
@@ -296,13 +282,9 @@ pub mod async {
 /// - native TLS backend cannot be initialized
 /// - supplied `Url` cannot be parsed
 /// - there was an error while sending request
-/// - redirect loop was detected
 /// - redirect limit was exhausted
-pub fn get<T: IntoUrl>(url: T) -> ::Result<Response> {
-    Client::builder()
-        .build()?
-        .get(url)
-        .send()
+pub async fn get<T: IntoUrl>(url: T) -> crate::Result<Response> {
+    Client::builder().build()?.get(url).send().await
 }
 
 fn _assert_impls() {
@@ -317,8 +299,53 @@ fn _assert_impls() {
     assert_send::<Request>();
     assert_send::<RequestBuilder>();
 
-    assert_send::<Response>();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        assert_send::<Response>();
+    }
 
     assert_send::<Error>();
     assert_sync::<Error>();
+}
+
+if_hyper! {
+    #[cfg(test)]
+    #[macro_use]
+    extern crate doc_comment;
+
+    #[cfg(test)]
+    doctest!("../README.md");
+
+    pub use self::async_impl::{
+        Body, Client, ClientBuilder, Request, RequestBuilder, Response, Upgraded,
+    };
+    pub use self::proxy::{Proxy,NoProxy};
+    #[cfg(feature = "__tls")]
+    // Re-exports, to be removed in a future release
+    pub use tls::{Certificate, Identity};
+    #[cfg(feature = "multipart")]
+    pub use self::async_impl::multipart;
+
+
+    mod async_impl;
+    #[cfg(feature = "blocking")]
+    pub mod blocking;
+    mod connect;
+    #[cfg(feature = "cookies")]
+    pub mod cookie;
+    pub mod dns;
+    mod proxy;
+    pub mod redirect;
+    #[cfg(feature = "__tls")]
+    pub mod tls;
+    mod util;
+}
+
+if_wasm! {
+    mod wasm;
+    mod util;
+
+    pub use self::wasm::{Body, Client, ClientBuilder, Request, RequestBuilder, Response};
+    #[cfg(feature = "multipart")]
+    pub use self::wasm::multipart;
 }
