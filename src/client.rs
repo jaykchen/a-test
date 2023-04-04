@@ -281,10 +281,33 @@ impl ClientBuilder {
     ///
     /// Pass `None` to disable timeout.
     pub fn timeout<T>(mut self, timeout: T) -> ClientBuilder
-    where T: Into<Option<Duration>>,
+    where
+        T: Into<Option<Duration>>,
     {
         self.timeout = Timeout(timeout.into());
         self
+    }
+
+    /// Sets the maximum idle connection per host allowed in the pool.
+    ///
+    /// Default is usize::MAX (no limit).
+    pub fn max_idle_per_host(self, max: usize) -> ClientBuilder {
+        self.with_inner(move |inner| inner.max_idle_per_host(max))
+    }
+
+    /// Set a timeout for only the connect phase of a `Client`.
+    ///
+    /// Default is `None`.
+    pub fn connect_timeout<T>(self, timeout: T) -> ClientBuilder
+    where
+        T: Into<Option<Duration>>,
+    {
+        let timeout = timeout.into();
+        if let Some(dur) = timeout {
+            self.with_inner(|inner| inner.connect_timeout(dur))
+        } else {
+            self
+        }
     }
 
     fn with_inner<F>(mut self, func: F) -> ClientBuilder
@@ -306,6 +329,19 @@ impl ClientBuilder {
     /// ```
     pub fn h2_prior_knowledge(self) -> ClientBuilder {
         self.with_inner(|inner| inner.h2_prior_knowledge())
+    }
+
+    /// Enable case sensitive headers.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let client = reqwest::Client::builder()
+    ///     .http1_title_case_headers()
+    ///     .build().unwrap();
+    /// ```
+    pub fn http1_title_case_headers(self) -> ClientBuilder {
+        self.with_inner(|inner| inner.http1_title_case_headers())
     }
 
     /// Bind to a local IP Address

@@ -2,6 +2,7 @@ use futures::Future;
 use http::uri::Scheme;
 use hyper::client::connect::{Connect, Connected, Destination};
 use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_timer::Timeout;
 
 
 #[cfg(feature = "default-tls")]
@@ -14,6 +15,7 @@ use bytes::BufMut;
 use std::io;
 use std::sync::Arc;
 use std::net::IpAddr;
+use std::time::Duration;
 
 #[cfg(feature = "trust-dns")]
 use dns::TrustDnsResolver;
@@ -26,8 +28,9 @@ type HttpConnector = ::hyper::client::HttpConnector;
 
 
 pub(crate) struct Connector {
+    inner: Inner,
     proxies: Arc<Vec<Proxy>>,
-    inner: Inner
+    timeout: Option<Duration>,
 }
 
 enum Inner {
@@ -49,8 +52,9 @@ impl Connector {
         let mut http = http_connector()?;
         http.set_local_address(local_addr.into());
         Ok(Connector {
+            inner: Inner::Http(http),
             proxies,
-            inner: Inner::Http(http)
+            timeout: None,
         })
     }
 
@@ -70,8 +74,9 @@ impl Connector {
         let http = ::hyper_tls::HttpsConnector::from((http, tls.clone()));
 
         Ok(Connector {
+            inner: Inner::DefaultTls(http, tls),
             proxies,
-            inner: Inner::DefaultTls(http, tls)
+            timeout: None,
         })
     }
 
@@ -86,12 +91,26 @@ impl Connector {
         let mut http = http_connector()?;
         http.set_local_address(local_addr.into());
         http.enforce_http(false);
-        let http = ::hyper_rustls::HttpsConnector::from((http, tls.clone()));
+
+        let inner = if proxies.is_empty() {
+            let tls = Arc::new(tls);
+            let http = ::hyper_rustls::HttpsConnector::from((http, tls.clone()));
+            Inner::RustlsTls(http, tls)
+        } else {
+            let mut tls_proxy = tls.clone();
+            tls_proxy.alpn_protocols.clear();
+            let http = ::hyper_rustls::HttpsConnector::from((http, tls_proxy));
+            Inner::RustlsTls(http, Arc::new(tls))
+        };
 
         Ok(Connector {
-            proxies,
-            inner: Inner::RustlsTls(http, Arc::new(tls))
+            inner, proxies,
+            timeout: None,
         })
+    }
+
+    pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
     }
 }
 
@@ -113,9 +132,27 @@ impl Connect for Connector {
     type Future = Connecting;
 
     fn connect(&self, dst: Destination) -> Self::Future {
+        macro_rules! timeout {
+            ($future:expr) => {
+                if let Some(dur) = self.timeout {
+                    Box::new(Timeout::new($future, dur).map_err(|err| {
+                        if err.is_inner() {
+                            err.into_inner().expect("is_inner")
+                        } else if err.is_elapsed() {
+                            io::Error::new(io::ErrorKind::TimedOut, "connect timed out")
+                        } else {
+                            io::Error::new(io::ErrorKind::Other, err)
+                        }
+                    }))
+                } else {
+                    Box::new($future)
+                }
+            }
+        }
+
         macro_rules! connect {
             ( $http:expr, $dst:expr, $proxy:expr ) => {
-                Box::new($http.connect($dst)
+                timeout!($http.connect($dst)
                     .map(|(io, connected)| (Box::new(io) as Conn, connected.proxy($proxy))))
             };
             ( $dst:expr, $proxy:expr ) => {
@@ -152,13 +189,12 @@ impl Connect for Connector {
                 match &self.inner {
                     #[cfg(feature = "default-tls")]
                     Inner::DefaultTls(http, tls) => if dst.scheme() == "https" {
-                        #[cfg(feature = "default-tls")]
-                        use connect_async::TlsConnectorExt;
+                        use self::native_tls_async::TlsConnectorExt;
 
                         let host = dst.host().to_owned();
                         let port = dst.port().unwrap_or(443);
                         let tls = tls.clone();
-                        return Box::new(http.connect(ndst).and_then(move |(conn, connected)| {
+                        return timeout!(http.connect(ndst).and_then(move |(conn, connected)| {
                             trace!("tunneling HTTPS over proxy");
                             tunnel(conn, host.clone(), port, auth)
                                 .and_then(move |tunneled| {
@@ -170,15 +206,14 @@ impl Connect for Connector {
                     },
                     #[cfg(feature = "rustls-tls")]
                     Inner::RustlsTls(http, tls) => if dst.scheme() == "https" {
-                        #[cfg(feature = "rustls-tls")]
+                        use rustls::Session;
                         use tokio_rustls::TlsConnector as RustlsConnector;
-                        #[cfg(feature = "rustls-tls")]
                         use tokio_rustls::webpki::DNSNameRef;
 
                         let host = dst.host().to_owned();
                         let port = dst.port().unwrap_or(443);
                         let tls = tls.clone();
-                        return Box::new(http.connect(ndst).and_then(move |(conn, connected)| {
+                        return timeout!(http.connect(ndst).and_then(move |(conn, connected)| {
                             trace!("tunneling HTTPS over proxy");
                             let maybe_dnsname = DNSNameRef::try_from_ascii_str(&host)
                                 .map(|dnsname| dnsname.to_owned())
@@ -189,7 +224,14 @@ impl Connect for Connector {
                                     RustlsConnector::from(tls).connect(dnsname.as_ref(), tunneled)
                                         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
                                 })
-                                .map(|io| (Box::new(io) as Conn, connected.proxy(true)))
+                                .map(|io| {
+                                    let connected = if io.get_ref().1.get_alpn_protocol() == Some(b"h2") {
+                                        connected.negotiated_h2()
+                                    } else {
+                                        connected
+                                    };
+                                    (Box::new(io) as Conn, connected.proxy(true))
+                                })
                         }));
                     },
                     #[cfg(not(feature = "tls"))]
@@ -295,6 +337,140 @@ fn tunnel_eof() -> io::Error {
         io::ErrorKind::UnexpectedEof,
         "unexpected eof while tunneling"
     )
+}
+
+#[cfg(feature = "default-tls")]
+mod native_tls_async {
+    use std::io::{self, Read, Write};
+
+    use futures::{Poll, Future, Async};
+    use native_tls::{self, HandshakeError, Error, TlsConnector};
+    use tokio_io::{AsyncRead, AsyncWrite};
+
+    /// A wrapper around an underlying raw stream which implements the TLS or SSL
+    /// protocol.
+    ///
+    /// A `TlsStream<S>` represents a handshake that has been completed successfully
+    /// and both the server and the client are ready for receiving and sending
+    /// data. Bytes read from a `TlsStream` are decrypted from `S` and bytes written
+    /// to a `TlsStream` are encrypted when passing through to `S`.
+    #[derive(Debug)]
+    pub struct TlsStream<S> {
+        inner: native_tls::TlsStream<S>,
+    }
+
+    /// Future returned from `TlsConnectorExt::connect_async` which will resolve
+    /// once the connection handshake has finished.
+    pub struct ConnectAsync<S> {
+        inner: MidHandshake<S>,
+    }
+
+    struct MidHandshake<S> {
+        inner: Option<Result<native_tls::TlsStream<S>, HandshakeError<S>>>,
+    }
+
+    /// Extension trait for the `TlsConnector` type in the `native_tls` crate.
+    pub trait TlsConnectorExt: sealed::Sealed {
+        /// Connects the provided stream with this connector, assuming the provided
+        /// domain.
+        ///
+        /// This function will internally call `TlsConnector::connect` to connect
+        /// the stream and returns a future representing the resolution of the
+        /// connection operation. The returned future will resolve to either
+        /// `TlsStream<S>` or `Error` depending if it's successful or not.
+        ///
+        /// This is typically used for clients who have already established, for
+        /// example, a TCP connection to a remote server. That stream is then
+        /// provided here to perform the client half of a connection to a
+        /// TLS-powered server.
+        ///
+        /// # Compatibility notes
+        ///
+        /// Note that this method currently requires `S: Read + Write` but it's
+        /// highly recommended to ensure that the object implements the `AsyncRead`
+        /// and `AsyncWrite` traits as well, otherwise this function will not work
+        /// properly.
+        fn connect_async<S>(&self, domain: &str, stream: S) -> ConnectAsync<S>
+            where S: Read + Write; // TODO: change to AsyncRead + AsyncWrite
+    }
+
+    mod sealed {
+        pub trait Sealed {}
+    }
+
+    impl<S: Read + Write> Read for TlsStream<S> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl<S: Read + Write> Write for TlsStream<S> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+
+    impl<S: AsyncRead + AsyncWrite> AsyncRead for TlsStream<S> {
+    }
+
+    impl<S: AsyncRead + AsyncWrite> AsyncWrite for TlsStream<S> {
+        fn shutdown(&mut self) -> Poll<(), io::Error> {
+            try_nb!(self.inner.shutdown());
+            self.inner.get_mut().shutdown()
+        }
+    }
+
+    impl TlsConnectorExt for TlsConnector {
+        fn connect_async<S>(&self, domain: &str, stream: S) -> ConnectAsync<S>
+            where S: Read + Write,
+        {
+            ConnectAsync {
+                inner: MidHandshake {
+                    inner: Some(self.connect(domain, stream)),
+                },
+            }
+        }
+    }
+
+    impl sealed::Sealed for TlsConnector {}
+
+    // TODO: change this to AsyncRead/AsyncWrite on next major version
+    impl<S: Read + Write> Future for ConnectAsync<S> {
+        type Item = TlsStream<S>;
+        type Error = Error;
+
+        fn poll(&mut self) -> Poll<TlsStream<S>, Error> {
+            self.inner.poll()
+        }
+    }
+
+    // TODO: change this to AsyncRead/AsyncWrite on next major version
+    impl<S: Read + Write> Future for MidHandshake<S> {
+        type Item = TlsStream<S>;
+        type Error = Error;
+
+        fn poll(&mut self) -> Poll<TlsStream<S>, Error> {
+            match self.inner.take().expect("cannot poll MidHandshake twice") {
+                Ok(stream) => Ok(TlsStream { inner: stream }.into()),
+                Err(HandshakeError::Failure(e)) => Err(e),
+                Err(HandshakeError::WouldBlock(s)) => {
+                    match s.handshake() {
+                        Ok(stream) => Ok(TlsStream { inner: stream }.into()),
+                        Err(HandshakeError::Failure(e)) => Err(e),
+                        Err(HandshakeError::WouldBlock(s)) => {
+                            self.inner = Some(Err(HandshakeError::WouldBlock(s)));
+                            Ok(Async::NotReady)
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(feature = "tls")]

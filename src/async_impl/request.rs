@@ -174,6 +174,15 @@ impl RequestBuilder {
         self.header(::header::AUTHORIZATION, &*header_value)
     }
 
+    /// Enable HTTP bearer authentication.
+    pub fn bearer_auth<T>(self, token: T) -> RequestBuilder
+    where
+        T: fmt::Display,
+    {
+        let header_value = format!("Bearer {}", token);
+        self.header(::header::AUTHORIZATION, &*header_value)
+    }
+
     /// Set the request body.
     pub fn body<T: Into<Body>>(mut self, body: T) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
@@ -346,7 +355,7 @@ impl RequestBuilder {
     /// ```
     pub fn send(self) -> impl Future<Item = Response, Error = ::Error> {
         match self.request {
-            Ok(req) => self.client.execute(req),
+            Ok(req) => self.client.execute_request(req),
             Err(err) => Pending::new_err(err),
         }
     }

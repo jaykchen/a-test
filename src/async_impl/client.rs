@@ -66,6 +66,10 @@ struct Config {
     hostname_verification: bool,
     #[cfg(feature = "tls")]
     certs_verification: bool,
+    connect_timeout: Option<Duration>,
+    max_idle_per_host: usize,
+    #[cfg(feature = "tls")]
+    identity: Option<Identity>,
     proxies: Vec<Proxy>,
     redirect_policy: RedirectPolicy,
     referer: bool,
@@ -73,10 +77,9 @@ struct Config {
     #[cfg(feature = "tls")]
     root_certs: Vec<Certificate>,
     #[cfg(feature = "tls")]
-    identity: Option<Identity>,
-    #[cfg(feature = "tls")]
     tls: TlsBackend,
     http2_only: bool,
+    http1_title_case_headers: bool,
     local_address: Option<IpAddr>,
 }
 
@@ -97,6 +100,8 @@ impl ClientBuilder {
                 hostname_verification: true,
                 #[cfg(feature = "tls")]
                 certs_verification: true,
+                connect_timeout: None,
+                max_idle_per_host: ::std::usize::MAX,
                 proxies: Vec::new(),
                 redirect_policy: RedirectPolicy::default(),
                 referer: true,
@@ -108,6 +113,7 @@ impl ClientBuilder {
                 #[cfg(feature = "tls")]
                 tls: TlsBackend::default(),
                 http2_only: false,
+                http1_title_case_headers: false,
                 local_address: None,
             },
         }
@@ -123,7 +129,7 @@ impl ClientBuilder {
         let config = self.config;
         let proxies = Arc::new(config.proxies);
 
-        let connector = {
+        let mut connector = {
             #[cfg(feature = "tls")]
             match config.tls {
                 #[cfg(feature = "default-tls")]
@@ -177,9 +183,17 @@ impl ClientBuilder {
             Connector::new(proxies.clone(), config.local_address)?
         };
 
+        connector.set_timeout(config.connect_timeout);
+
         let mut builder = ::hyper::Client::builder();
         if config.http2_only {
             builder.http2_only(true);
+        }
+
+        builder.max_idle_per_host(config.max_idle_per_host);
+
+        if config.http1_title_case_headers {
+            builder.http1_title_case_headers(true);
         }
 
         let hyper_client = builder.build(connector);
@@ -312,15 +326,43 @@ impl ClientBuilder {
         self
     }
 
-    /// Set a timeout for both the read and write operations of a client.
+    // Currently not used, so hide from docs.
+    #[doc(hidden)]
     pub fn timeout(mut self, timeout: Duration) -> ClientBuilder {
         self.config.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the maximum idle connection per host allowed in the pool.
+    //
+    // Default is usize::MAX (no limit).
+    pub fn max_idle_per_host(mut self, max: usize) -> ClientBuilder {
+        self.config.max_idle_per_host = max;
         self
     }
 
     /// Only use HTTP/2.
     pub fn h2_prior_knowledge(mut self) -> ClientBuilder {
         self.config.http2_only = true;
+        self
+    }
+
+    /// Enable case sensitive headers.
+    pub fn http1_title_case_headers(mut self) -> ClientBuilder {
+        self.config.http1_title_case_headers = true;
+        self
+    }
+
+    /// Set a timeout for only the connect phase of a `Client`.
+    ///
+    /// Default is `None`.
+    ///
+    /// # Note
+    ///
+    /// This **requires** the futures be executed in a tokio runtime with
+    /// a tokio timer enabled.
+    pub fn connect_timeout(mut self, timeout: Duration) -> ClientBuilder {
+        self.config.connect_timeout = Some(timeout);
         self
     }
 
@@ -446,12 +488,12 @@ impl Client {
     ///
     /// This method fails if there was an error while sending request,
     /// redirect loop was detected or redirect limit was exhausted.
-    pub fn execute(&self, request: Request) -> Pending {
+    pub fn execute(&self, request: Request) -> impl Future<Item = Response, Error = ::Error> {
         self.execute_request(request)
     }
 
 
-    fn execute_request(&self, req: Request) -> Pending {
+    pub(super) fn execute_request(&self, req: Request) -> Pending {
         let (
             method,
             url,
