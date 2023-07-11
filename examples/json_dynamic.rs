@@ -11,27 +11,7 @@ fn main() -> Result<(), reqwest::Error> {
         .post("https://jsonplaceholder.typicode.com/posts")
         .json(
             &json!({
-                "title": "Reqwest.rs",
-                "body": "https://docs.rs/reqwest",
-                "userId": 1
-            })
-        )
-        .send()?
-        .json()?;
 
-    println!("{:#?}", echo_json);
-    // Object(
-    //     {
-    //         "body": String(
-    //             "https://docs.rs/reqwest"
-    //         ),
-    //         "id": Number(
-    //             101
-    //         ),
-    //         "title": String(
-    //             "Reqwest.rs"
-    //         ),
-    //         "userId": Number(
     //             1
     //         )
     //     }
