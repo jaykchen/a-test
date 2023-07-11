@@ -9,17 +9,7 @@ extern crate serde_json;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Post {
-    id: Option<i32>,
-    title: String,
-    body: String,
-    #[serde(rename = "userId")]
-    user_id: i32,
-}
-
-fn main() -> Result<(), reqwest::Error> {
-    let new_post = Post {
-        id: None,
-        title: "Reqwest.rs".into(),
+t.rs".into(),
         body: "https://docs.rs/reqwest".into(),
         user_id: 1
     };
